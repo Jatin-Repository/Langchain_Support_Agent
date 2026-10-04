@@ -1,267 +1,1018 @@
+import json
+import uuid
+from pathlib import Path
+
 import streamlit as st
-from dotenv import load_dotenv
-from uuid import uuid4
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-
+from agent import get_agent, get_thread_config
 from auth import authenticate_user
+from context import SessionContext
+from gmail_tools import initialize_gmail, is_gmail_available
+from hitl_utils import handle_interrupt
+from rag_tools import initialize_vector_store
 
 
-def get_llm():
-    return ChatOpenAI(
-        model="gpt-4.1-mini",
-        temperature=0.3
-    )
+# ============================================================
+# Paths
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+CHAT_THREADS_FILE = PROJECT_ROOT / "chat_threads.json"
 
 
-def build_chain(llm):
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a concise, helpful assistant. "
-                "Use prior chat history to stay on context."
-            ),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", "{input}")
-        ]
-    )
+# ============================================================
+# Page configuration
+# ============================================================
 
-    return prompt | llm
+st.set_page_config(
+    page_title="E-Commerce Support Agent",
+    page_icon="🛒",
+    layout="wide",
+)
 
+
+# ============================================================
+# Session initialization
+# ============================================================
 
 def init_session():
+    """
+    Initialize Streamlit session state.
+
+    LangGraph checkpointer remains the source of truth for
+    conversation messages. Session state only stores UI state
+    and conversation/thread identifiers.
+    """
+
     st.session_state.setdefault("conversations", {})
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("user_email", None)
     st.session_state.setdefault("user_role", None)
     st.session_state.setdefault("conversation_id", None)
 
+    st.session_state.setdefault(
+        "pending_action_message",
+        None,
+    )
+
+    st.session_state.setdefault(
+        "logged_in",
+        False,
+    )
+
+
+# ============================================================
+# Conversation persistence
+# ============================================================
+
+def load_threads():
+    """
+    Load conversation metadata.
+
+    The actual messages are NOT stored here.
+    Messages come from the LangGraph checkpointer.
+    """
+
+    if not CHAT_THREADS_FILE.exists():
+        return {}
+
+    try:
+        with open(
+            CHAT_THREADS_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return {}
+
+        cleaned = {}
+
+        for email, threads in data.items():
+
+            if not isinstance(threads, list):
+                continue
+
+            valid_threads = []
+
+            for thread in threads:
+
+                if not isinstance(thread, dict):
+                    continue
+
+                conversation_id = thread.get(
+                    "conversation_id"
+                )
+
+                if not conversation_id:
+                    continue
+
+                valid_threads.append(
+                    {
+                        "conversation_id": conversation_id,
+                        "title": thread.get(
+                            "title",
+                            "New Conversation",
+                        ),
+                    }
+                )
+
+            cleaned[email] = valid_threads
+
+        return cleaned
+
+    except Exception as exc:
+        print(
+            f"[CHAT] Failed to load conversations: {exc}"
+        )
+        return {}
+
+
+def save_threads(threads):
+    """
+    Persist conversation metadata.
+    """
+
+    try:
+        with open(
+            CHAT_THREADS_FILE,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                threads,
+                f,
+                indent=2,
+            )
+
+    except Exception as exc:
+        print(
+            f"[CHAT] Failed to save conversations: {exc}"
+        )
+
+
+def add_thread(
+    user_email,
+    conversation_id,
+    title="New Conversation",
+):
+    """
+    Add a conversation to the user's conversation list.
+    """
+
+    conversations = load_threads()
+
+    conversations.setdefault(
+        user_email,
+        [],
+    )
+
+    # Avoid duplicates.
+    existing_ids = {
+        thread.get("conversation_id")
+        for thread in conversations[user_email]
+        if isinstance(thread, dict)
+    }
+
+    if conversation_id not in existing_ids:
+
+        conversations[user_email].insert(
+            0,
+            {
+                "conversation_id": conversation_id,
+                "title": title,
+            },
+        )
+
+    save_threads(conversations)
+
 
 def start_new_conversation():
-    conversation_id = str(uuid4())
+    """
+    Create a new conversation/thread.
+    """
 
-    messages = [
-        AIMessage(content="Hi! Ask me anything.")
-    ]
+    user_email = st.session_state["user_email"]
 
-    st.session_state.conversations[conversation_id] = messages.copy()
-    st.session_state.messages = messages.copy()
-    st.session_state.conversation_id = conversation_id
+    conversation_id = str(
+        uuid.uuid4()
+    )
+
+    st.session_state["conversation_id"] = (
+        conversation_id
+    )
+
+    st.session_state["messages"] = []
+
+    st.session_state[
+        "pending_action_message"
+    ] = None
+
+    add_thread(
+        user_email=user_email,
+        conversation_id=conversation_id,
+        title="New Conversation",
+    )
+
+    return conversation_id
 
 
-def load_conversation(conv_id):
-    if conv_id in st.session_state.conversations:
-        st.session_state.conversation_id = conv_id
+# ============================================================
+# LangGraph state helpers
+# ============================================================
 
-        st.session_state.messages = (
-            st.session_state.conversations[conv_id].copy()
+def get_current_messages(config):
+    """
+    Read conversation messages from the LangGraph
+    checkpointer.
+
+    The checkpointer is the source of truth.
+    """
+
+    try:
+        agent = get_agent()
+
+        snapshot = agent.get_state(
+            config
         )
+
+        if not snapshot:
+            return []
+
+        values = getattr(
+            snapshot,
+            "values",
+            None,
+        )
+
+        if not isinstance(values, dict):
+            return []
+
+        messages = values.get(
+            "messages",
+            [],
+        )
+
+        if not isinstance(messages, list):
+            return []
+
+        return messages
+
+    except Exception as exc:
+
+        print(
+            f"[CHAT] Unable to read checkpoint state: {exc}"
+        )
+
+        return []
+
+
+def has_pending_interrupt(config):
+    """
+    Check whether this LangGraph thread currently has
+    an unresolved Human-In-The-Loop interrupt.
+
+    This is critical because an interrupted tool call leaves
+    an assistant tool-call message waiting for the corresponding
+    tool response. Sending another user message on the same
+    thread before resume can cause OpenAI to reject the message
+    sequence.
+    """
+
+    try:
+
+        agent = get_agent()
+
+        snapshot = agent.get_state(
+            config
+        )
+
+        if not snapshot:
+            return False
+
+        tasks = getattr(
+            snapshot,
+            "tasks",
+            None,
+        ) or []
+
+        for task in tasks:
+
+            interrupts = getattr(
+                task,
+                "interrupts",
+                None,
+            )
+
+            if interrupts:
+                return True
+
+        return False
+
+    except Exception as exc:
+
+        print(
+            f"[HITL] Unable to inspect interrupt state: {exc}"
+        )
+
+        return False
+
+
+# ============================================================
+# Message rendering
+# ============================================================
+
+def extract_message_content(message):
+    """
+    Extract displayable content from a LangChain message.
+    """
+
+    content = getattr(
+        message,
+        "content",
+        "",
+    )
+
+    if isinstance(
+        content,
+        str,
+    ):
+        return content
+
+    if isinstance(
+        content,
+        list,
+    ):
+
+        parts = []
+
+        for item in content:
+
+            if isinstance(
+                item,
+                dict,
+            ):
+
+                text_value = item.get(
+                    "text"
+                )
+
+                if text_value:
+                    parts.append(
+                        str(text_value)
+                    )
+
+            elif isinstance(
+                item,
+                str,
+            ):
+
+                parts.append(item)
+
+        return "\n".join(parts)
+
+    return str(content)
 
 
 def render_history():
-    for msg in st.session_state.messages:
-        if isinstance(msg, HumanMessage):
-            role = "user"
-        else:
-            role = "assistant"
+    """
+    Render conversation history from LangGraph checkpoint.
+    """
 
-        with st.chat_message(role):
-            st.markdown(msg.content)
+    user_email = st.session_state[
+        "user_email"
+    ]
 
+    conversation_id = st.session_state[
+        "conversation_id"
+    ]
 
-def chat_round(llm, user_input):
-    # Add user message to current conversation
-    st.session_state.messages.append(
-        HumanMessage(content=user_input)
+    if not user_email or not conversation_id:
+        return
+
+    config = get_thread_config(
+        user_email,
+        conversation_id,
     )
 
-    chain = build_chain(llm)
-
-    # Generate response
-    response = chain.invoke(
-        {
-            "input": user_input,
-            "history": st.session_state.messages
-        }
+    messages = get_current_messages(
+        config
     )
 
-    # Add assistant response
-    st.session_state.messages.append(response)
+    for message in messages:
 
-    # Persist updated messages to the current conversation
-    conversation_id = st.session_state.conversation_id
-
-    if conversation_id:
-        st.session_state.conversations[conversation_id] = (
-            st.session_state.messages.copy()
+        message_type = getattr(
+            message,
+            "type",
+            "",
         )
 
-    return response.content
+        content = extract_message_content(
+            message
+        )
+
+        if not content.strip():
+            continue
+
+        # Human/user messages
+        if message_type == "human":
+
+            with st.chat_message("user"):
+                st.markdown(content)
+
+        # AI messages
+        elif message_type == "ai":
+
+            # Avoid displaying empty tool-call-only AI messages.
+            if content.strip():
+
+                with st.chat_message("assistant"):
+                    st.markdown(content)
 
 
-def main():
-    st.set_page_config(
-        page_title="LangChain Bot",
-        page_icon="🤖"
+# ============================================================
+# Chat processing
+# ============================================================
+
+def chat_round(user_input):
+    """
+    Process one customer message.
+
+    Customer messages are blocked when the thread is waiting
+    for an administrator HITL decision.
+    """
+
+    agent = get_agent()
+
+    user_email = st.session_state[
+        "user_email"
+    ]
+
+    conversation_id = st.session_state[
+        "conversation_id"
+    ]
+
+    user_role = st.session_state.get(
+        "user_role",
+        "customer",
     )
 
-    st.title("LangChain Bot")
-
-    st.caption(
-        "A simple conversational assistant powered by LangChain and OpenAI."
+    config = get_thread_config(
+        user_email,
+        conversation_id,
     )
 
-    load_dotenv()
-    init_session()
+    thread_id = config[
+        "configurable"
+    ][
+        "thread_id"
+    ]
 
-    # ---------------------------------------------------------
-    # LOGIN
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # CRITICAL HITL PROTECTION
+    # --------------------------------------------------------
 
-    user_email = st.session_state.user_email
+    if has_pending_interrupt(
+        config
+    ):
 
-    if not user_email:
-        st.subheader("Login")
+        message = (
+            "⏳ Your cancellation/return request "
+            "is already waiting for administrator "
+            "approval."
+        )
 
-        with st.form("login_form"):
-            email = st.text_input("Email")
-            password = st.text_input(
-                "Password",
-                type="password"
-            )
+        st.session_state[
+            "pending_action_message"
+        ] = message
 
-            role = st.selectbox(
-                "Role",
-                ["customer", "admin"]
-            )
-
-            submitted = st.form_submit_button("Login")
-
-            if submitted:
-                user = authenticate_user(
-                    email=email,
-                    password=password,
-                    role=role
-                )
-
-                if user:
-                    st.session_state.user_email = user["email"]
-                    st.session_state.user_role = user["role"]
-
-                    st.success("Login successful!")
-
-                    st.rerun()
-
-                else:
-                    st.error(
-                        "Invalid email, password, or role."
-                    )
+        st.warning(message)
 
         return
 
-    # ---------------------------------------------------------
-    # SIDEBAR
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Session context
+    # --------------------------------------------------------
 
-    with st.sidebar:
-        st.header("Conversations")
+    context = SessionContext(
+        user_email=user_email,
+        conversation_id=conversation_id,
+        role=user_role,
+    )
 
-        # Create a new conversation
-        if st.button(
-            "Start new conversation",
-            use_container_width=True
-        ):
-            start_new_conversation()
+    try:
+
+        result = agent.invoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": user_input,
+                    }
+                ]
+            },
+            config=config,
+            context=context,
+        )
+
+        # ----------------------------------------------------
+        # Check for HITL interruption
+        # ----------------------------------------------------
+
+        pending = handle_interrupt(
+            result=result,
+            thread_id=thread_id,
+            user_email=user_email,
+        )
+
+        if pending:
+
+            st.session_state[
+                "pending_action_message"
+            ] = pending.get(
+                "message",
+                "⏳ Your request is waiting "
+                "for administrator approval.",
+            )
+
+        else:
+
+            st.session_state[
+                "pending_action_message"
+            ] = None
+
+    except Exception as exc:
+
+        print(
+            f"[CHAT] Agent invocation failed: {exc}"
+        )
+
+        st.error(
+            "Something went wrong while processing "
+            "your request."
+        )
+
+        st.session_state[
+            "pending_action_message"
+        ] = None
+
+    st.rerun()
+
+
+# ============================================================
+# Login
+# ============================================================
+
+def render_login():
+    """
+    Render login screen.
+    """
+
+    st.title(
+        "🛒 E-Commerce Customer Support"
+    )
+
+    st.subheader(
+        "Login"
+    )
+
+    with st.form(
+        "login_form"
+    ):
+
+        email = st.text_input(
+            "Email"
+        )
+
+        password = st.text_input(
+            "Password",
+            type="password",
+        )
+
+        submitted = st.form_submit_button(
+            "Login",
+            use_container_width=True,
+        )
+
+    if submitted:
+
+        if not email or not password:
+
+            st.error(
+                "Please enter your email and password."
+            )
+
+            return
+
+        try:
+
+            user = authenticate_user(
+                email,
+                password,
+            )
+
+            if not user:
+
+                st.error(
+                    "Invalid email or password."
+                )
+
+                return
+
+            st.session_state[
+                "logged_in"
+            ] = True
+
+            st.session_state[
+                "user_email"
+            ] = user["email"]
+
+            st.session_state[
+                "user_role"
+            ] = user.get(
+                "role",
+                "customer",
+            )
+
+            # ------------------------------------------------
+            # Load user's existing conversations
+            # ------------------------------------------------
+
+            conversations = load_threads()
+
+            user_threads = conversations.get(
+                user["email"],
+                [],
+            )
+
+            if user_threads:
+
+                first_thread = user_threads[0]
+
+                st.session_state[
+                    "conversation_id"
+                ] = first_thread[
+                    "conversation_id"
+                ]
+
+            else:
+
+                start_new_conversation()
+
             st.rerun()
 
-        conversations = st.session_state.conversations
+        except Exception as exc:
 
-        if conversations:
-            conversation_options = list(
-                conversations.keys()
+            st.error(
+                f"Login failed: {exc}"
             )
 
-            current_conversation = (
-                st.session_state.conversation_id
+
+# ============================================================
+# Sidebar
+# ============================================================
+
+def render_sidebar():
+    """
+    Render application sidebar.
+    """
+
+    with st.sidebar:
+
+        st.title(
+            "🛒 Support Agent"
+        )
+
+        st.divider()
+
+        user_email = st.session_state[
+            "user_email"
+        ]
+
+        user_role = st.session_state[
+            "user_role"
+        ]
+
+        st.markdown(
+            f"**User:** {user_email}"
+        )
+
+        st.markdown(
+            f"**Role:** {user_role}"
+        )
+
+        st.divider()
+
+        # ----------------------------------------------------
+        # System status
+        # ----------------------------------------------------
+
+        st.subheader(
+            "System Status"
+        )
+
+        try:
+
+            st.success(
+                "✓ LangGraph Agent"
             )
 
-            # Determine currently selected thread
-            if current_conversation in conversation_options:
-                current_index = conversation_options.index(
-                    current_conversation
-                )
-            else:
-                current_index = 0
+        except Exception:
 
-            selected_conversation = st.selectbox(
-                "Select conversation",
-                conversation_options,
-                index=current_index
+            st.error(
+                "✗ LangGraph Agent"
             )
 
-            # Load selected thread
-            if selected_conversation != current_conversation:
-                load_conversation(
-                    selected_conversation
-                )
+        try:
+
+            initialize_vector_store()
+
+            st.success(
+                "✓ Policy RAG"
+            )
+
+        except Exception as exc:
+
+            st.warning(
+                f"⚠ Policy RAG unavailable"
+            )
+
+            print(
+                f"[RAG] {exc}"
+            )
+
+        if is_gmail_available():
+
+            st.success(
+                "✓ Gmail"
+            )
+
+        else:
+
+            st.warning(
+                "⚠ Gmail unavailable"
+            )
+
+        st.divider()
+
+        # ----------------------------------------------------
+        # New conversation
+        # ----------------------------------------------------
+
+        if st.button(
+            "➕ New Conversation",
+            use_container_width=True,
+        ):
+
+            start_new_conversation()
+
+            st.rerun()
+
+        st.subheader(
+            "Conversations"
+        )
+
+        conversations = load_threads()
+
+        threads = conversations.get(
+            user_email,
+            [],
+        )
+
+        current_id = st.session_state[
+            "conversation_id"
+        ]
+
+        for thread in threads:
+
+            if not isinstance(
+                thread,
+                dict,
+            ):
+                continue
+
+            conversation_id = thread.get(
+                "conversation_id"
+            )
+
+            if not conversation_id:
+                continue
+
+            title = thread.get(
+                "title",
+                "Conversation",
+            )
+
+            is_current = (
+                conversation_id
+                == current_id
+            )
+
+            label = (
+                f"🟢 {title}"
+                if is_current
+                else title
+            )
+
+            if st.button(
+                label,
+                key=f"thread_{conversation_id}",
+                use_container_width=True,
+            ):
+
+                st.session_state[
+                    "conversation_id"
+                ] = conversation_id
+
+                st.session_state[
+                    "pending_action_message"
+                ] = None
 
                 st.rerun()
 
-        else:
-            st.selectbox(
-                "Select conversation",
-                ["(no threads yet)"]
-            )
+        st.divider()
 
-    # ---------------------------------------------------------
-    # CURRENT CONVERSATION INFORMATION
-    # ---------------------------------------------------------
+        # ----------------------------------------------------
+        # Logout
+        # ----------------------------------------------------
 
-    conversation_id = (
-        st.session_state.conversation_id
-        or "—"
+        if st.button(
+            "Logout",
+            use_container_width=True,
+        ):
+
+            st.session_state.clear()
+
+            st.rerun()
+
+
+# ============================================================
+# Main application
+# ============================================================
+
+def main():
+
+    init_session()
+
+    # --------------------------------------------------------
+    # Authentication
+    # --------------------------------------------------------
+
+    if not st.session_state.get(
+        "logged_in",
+        False,
+    ):
+
+        render_login()
+
+        return
+
+    # --------------------------------------------------------
+    # Sidebar
+    # --------------------------------------------------------
+
+    render_sidebar()
+
+    # --------------------------------------------------------
+    # Main header
+    # --------------------------------------------------------
+
+    st.title(
+        "🛒 E-Commerce Customer Support"
     )
 
-    st.info(
-        f"Logged in as: {st.session_state.user_email}  \n"
-        f"Role: {st.session_state.user_role}  \n"
-        f"Conversation: {conversation_id}"
+    st.caption(
+        "AI-powered customer support with policy search, "
+        "order lookup, email assistance, and administrator "
+        "approval for sensitive actions."
     )
 
-    # ---------------------------------------------------------
-    # CHAT HISTORY
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Initialize application services
+    # --------------------------------------------------------
+
+    try:
+
+        initialize_vector_store()
+
+    except Exception as exc:
+
+        print(
+            f"[RAG] Initialization failed: {exc}"
+        )
+
+    try:
+
+        initialize_gmail()
+
+    except Exception as exc:
+
+        print(
+            f"[GMAIL] Initialization failed: {exc}"
+        )
+
+    # --------------------------------------------------------
+    # Conversation validation
+    # --------------------------------------------------------
+
+    if not st.session_state.get(
+        "conversation_id"
+    ):
+
+        start_new_conversation()
+
+    # --------------------------------------------------------
+    # Render previous conversation
+    # --------------------------------------------------------
 
     render_history()
 
-    # ---------------------------------------------------------
-    # CHAT INPUT
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Pending action message
+    # --------------------------------------------------------
 
-    prompt = st.chat_input(
-        "Ask a question"
+    pending_message = st.session_state.get(
+        "pending_action_message"
     )
 
-    if prompt:
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    if pending_message:
 
-        llm = get_llm()
+        st.info(
+            pending_message
+        )
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = chat_round(
-                    llm,
-                    prompt
+    # --------------------------------------------------------
+    # Check current HITL state
+    # --------------------------------------------------------
+
+    user_email = st.session_state[
+        "user_email"
+    ]
+
+    conversation_id = st.session_state[
+        "conversation_id"
+    ]
+
+    config = get_thread_config(
+        user_email,
+        conversation_id,
+    )
+
+    pending_interrupt = has_pending_interrupt(
+        config
+    )
+
+    # --------------------------------------------------------
+    # Customer input
+    #
+    # IMPORTANT:
+    # Never accept another message while an action tool
+    # is paused for administrator approval.
+    # --------------------------------------------------------
+
+    if pending_interrupt:
+
+        st.warning(
+            "⏳ Your cancellation/return request is "
+            "waiting for administrator approval."
+        )
+
+        st.info(
+            "You can continue chatting once the "
+            "administrator has approved or rejected "
+            "the request."
+        )
+
+        st.chat_input(
+            "Waiting for administrator approval...",
+            disabled=True,
+        )
+
+    else:
+
+        user_input = st.chat_input(
+            "How can I help you today?"
+        )
+
+        if user_input:
+
+            # Display the user's new message immediately.
+            with st.chat_message("user"):
+
+                st.markdown(
+                    user_input
                 )
 
-                st.markdown(response)
+            chat_round(
+                user_input
+            )
 
-        st.rerun()
 
+# ============================================================
+# Entry point
+# ============================================================
 
 if __name__ == "__main__":
     main()

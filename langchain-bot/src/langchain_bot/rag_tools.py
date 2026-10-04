@@ -27,7 +27,7 @@ def load_policy_documents() -> list[Document]:
     #   parents[2] -> project root
     project_root = Path(__file__).resolve().parent.parent.parent
 
-    policies_dir = project_root / "policies"
+    policies_dir = project_root / "src" / "langchain_bot" / "data" / "policies"
 
     documents: list[Document] = []
 
@@ -227,5 +227,4 @@ __all__ = [
 #     result = search_policies.invoke(
 #         {"query": "What is the return policy?"}
 #     )
-#     print(result)
-
+#     print(search_policies.invoke({'query':'return window'})[:200])
