@@ -3,12 +3,13 @@ import sqlite3
 
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
-from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain.agents.middleware import HumanInTheLoopMiddleware, dynamic_prompt
+from settings import checkpoint_path
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from context import SessionContext
 from action_tools import get_action_tools
-from gmail_tools import get_gmail_tools
+
 from middleware import get_logging_middleware
 from rag_tools import search_policies
 from sql_tools import get_sql_tools
@@ -123,16 +124,12 @@ unless the corresponding action tool has actually completed successfully.
 
 EMAIL:
 
-Email is optional.
-
-Only send an email AFTER the corresponding database action has
-successfully completed.
-
-Never send an approval email before administrator approval.
-
-Never claim that an email was sent unless the Gmail tool confirms success.
-
-If Gmail is unavailable, continue without email.
+The action tools automatically attempt one notification to the authenticated
+customer AFTER the database transaction commits. Do not call another email tool.
+Report the Email status returned by the action tool. SENT means Gmail accepted
+the message, not that delivery to the recipient inbox has been verified.
+NOT_SENT means the database action succeeded but its notification was not sent.
+Never invent an email confirmation. Email failure does not reverse approval.
 
 GENERAL:
 
@@ -147,14 +144,19 @@ before requesting a protected action.
 """
 
 
+@dynamic_prompt
+def identity_prompt(request):
+    import json
+    context = request.runtime.context
+    return SYSTEM_PROMPT + "\nAuthenticated customer email: " + json.dumps(context.user_email)
+
+
 def get_checkpointer():
     global _checkpointer
 
     if _checkpointer is None:
-        db_path = os.getenv(
-            "CHECKPOINTS_DB_PATH",
-            "checkpoints.sqlite",
-        )
+        db_path = checkpoint_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
         conn = sqlite3.connect(
             db_path,
@@ -184,13 +186,13 @@ def get_agent():
         llm = ChatOpenAI(
             model="gpt-4.1-mini",
             temperature=0,
+            parallel_tool_calls=False,
         )
 
         tools = [
             search_policies,
             *get_sql_tools(),
             *get_action_tools(),
-            *get_gmail_tools(),
         ]
 
         hitl = HumanInTheLoopMiddleware(
@@ -224,6 +226,7 @@ def get_agent():
             system_prompt=SYSTEM_PROMPT,
             context_schema=SessionContext,
             middleware=[
+                identity_prompt,
                 *get_logging_middleware(),
                 hitl,
             ],

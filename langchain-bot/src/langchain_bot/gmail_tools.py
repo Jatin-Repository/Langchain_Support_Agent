@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from langchain_google_community import GmailToolkit
+from langchain_google_community.gmail.send_message import GmailSendMessage
 from langchain_google_community.gmail.utils import (
     build_resource_service,
     get_gmail_credentials,
@@ -28,6 +28,7 @@ GMAIL_SCOPE = [
 _gmail_service = None
 _gmail_toolkit = None
 _gmail_initialized = False
+_gmail_error = None
 
 
 # ---------------------------------------------------------
@@ -72,6 +73,7 @@ def initialize_gmail() -> bool:
     global _gmail_service
     global _gmail_toolkit
     global _gmail_initialized
+    global _gmail_error
 
     if _gmail_initialized:
         return _gmail_service is not None
@@ -82,15 +84,15 @@ def initialize_gmail() -> bool:
 
         _gmail_service = get_gmail_service()
 
-        _gmail_toolkit = GmailToolkit(
-            api_resource=_gmail_service
-        )
+        _gmail_toolkit = GmailSendMessage(api_resource=_gmail_service)
 
+        _gmail_error = None
         print("[GMAIL] Gmail initialized successfully")
 
         return True
 
     except Exception as exc:
+        _gmail_error = str(exc)
 
         _gmail_service = None
         _gmail_toolkit = None
@@ -114,7 +116,7 @@ def get_gmail_tools():
     if not initialize_gmail():
         return []
 
-    return _gmail_toolkit.get_tools()
+    return [_gmail_toolkit]
 
 
 # ---------------------------------------------------------
@@ -127,3 +129,47 @@ def is_gmail_available() -> bool:
     """
 
     return _gmail_service is not None
+
+
+def get_gmail_error():
+    """Return the last setup/send failure for the administrator."""
+    return _gmail_error
+
+
+def send_action_notification(user_email, subject, body):
+    """Send one post-approval email to the database-verified customer.
+
+    Sending is explicit application code, never an LLM tool choice. Failure
+    is reported independently and does not undo a committed business action.
+    """
+    import base64
+    from email.message import EmailMessage
+    global _gmail_error
+    if not initialize_gmail():
+        return {"sent": False, "message_id": None,
+                "error": _gmail_error or "Gmail is not configured."}
+    try:
+        message = EmailMessage()
+        message["To"] = user_email
+        message["Subject"] = subject
+        message.set_content(body)
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+        response = _gmail_service.users().messages().send(
+            userId="me", body={"raw": raw}
+        ).execute()
+        message_id = response.get("id")
+        if not message_id:
+            raise RuntimeError("Gmail did not return a message ID.")
+        _gmail_error = None
+        print(f"[GMAIL] Approval notification accepted: message_id={message_id}")
+        return {"sent": True, "message_id": message_id, "error": None}
+    except Exception as exc:
+        _gmail_error = f"{type(exc).__name__}: {exc}"
+        print(f"[GMAIL] Approval notification failed: {_gmail_error}")
+        return {"sent": False, "message_id": None, "error": _gmail_error}
+
+
+def notification_status(result):
+    if result["sent"]:
+        return f"Email status: SENT (Gmail message ID: {result['message_id']})."
+    return f"Email status: NOT_SENT. {result['error']}"

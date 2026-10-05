@@ -554,9 +554,8 @@ def chat_round(user_input):
             "your request."
         )
 
-        st.session_state[
-            "pending_action_message"
-        ] = None
+        st.session_state["pending_action_message"] = None
+        return
 
     st.rerun()
 
@@ -937,6 +936,12 @@ def main():
         "pending_action_message"
     )
 
+    if pending_message and not has_pending_interrupt(get_thread_config(
+        st.session_state["user_email"], st.session_state["conversation_id"]
+    )) and "approval" in pending_message:
+        pending_message = None
+        st.session_state["pending_action_message"] = None
+
     if pending_message:
 
         st.info(
@@ -991,7 +996,7 @@ def main():
         )
 
     else:
-
+        st.session_state["pending_action_message"] = None
         user_input = st.chat_input(
             "How can I help you today?"
         )

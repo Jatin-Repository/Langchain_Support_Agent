@@ -5,6 +5,10 @@ from pathlib import Path
 from langgraph.types import Command
 
 from agent import get_agent
+from context import SessionContext
+from action_tools import owned_order, return_item
+
+ACTION_TYPES = {"cancel_order_action": "CANCEL_ORDER", "create_return_action": "CREATE_RETURN"}
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -35,16 +39,29 @@ def _ensure_pending_actions_table(conn):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             thread_id TEXT NOT NULL,
             user_email TEXT NOT NULL,
-            action_type TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK(action_type IN ('CANCEL_ORDER','CREATE_RETURN')),
             order_id TEXT NOT NULL,
             product_name TEXT,
             reason TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
+            status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','APPROVED','REJECTED','FAILED')),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+
+    schema = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'pending_actions'").fetchone()[0]
+    if "CHECK" in schema.upper() and "FAILED" not in schema.upper():
+        conn.execute("ALTER TABLE pending_actions RENAME TO pending_actions_legacy")
+        conn.execute("""CREATE TABLE pending_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL,
+            user_email TEXT NOT NULL, action_type TEXT NOT NULL CHECK(action_type IN ('CANCEL_ORDER','CREATE_RETURN')),
+            order_id INTEGER NOT NULL, product_name TEXT, reason TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','APPROVED','REJECTED','FAILED')),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY(order_id) REFERENCES orders(id))""")
+        conn.execute("INSERT INTO pending_actions SELECT * FROM pending_actions_legacy")
+        conn.execute("DROP TABLE pending_actions_legacy")
 
     conn.execute(
         """
@@ -125,17 +142,7 @@ def _validate_action(
     try:
         cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            SELECT order_id, user_email, status
-            FROM orders
-            WHERE order_id = ?
-              AND user_email = ?
-            """,
-            (order_id, user_email),
-        )
-
-        order = cursor.fetchone()
+        order = owned_order(conn, order_id, user_email)
 
         if not order:
             return {
@@ -200,10 +207,12 @@ def _validate_action(
                     ),
                 }
 
-            return {
-                "valid": True,
-                "reason": None,
-            }
+            item = return_item(conn, order_id, product_name)
+            if not item:
+                return {"valid": False, "reason": "The exact product was not uniquely found in this order."}
+            if conn.execute("SELECT id FROM returns WHERE order_item_id = ? AND status != 'REJECTED'", (item["id"],)).fetchone():
+                return {"valid": False, "reason": "This product already has an active return."}
+            return {"valid": True, "reason": None}
 
         return {
             "valid": False,
@@ -249,11 +258,7 @@ def _resume_invalid_interrupt(
     return agent.invoke(
         command,
         config=config,
-        context={
-            "user_email": user_email,
-            "conversation_id": conversation_id,
-            "role": "customer",
-        },
+        context=SessionContext(user_email, conversation_id, "customer"),
     )
 
 
@@ -289,13 +294,6 @@ def handle_interrupt(
     order_id = args.get("order_id")
     product_name = args.get("product_name")
     reason = args.get("reason")
-
-    if not order_id:
-        return {
-            "pending_id": None,
-            "duplicate": False,
-            "message": "I need a valid order ID to process this request.",
-        }
 
     validation = _validate_action(
         action_type=action_type,
@@ -345,11 +343,12 @@ def handle_interrupt(
     # VALID ACTION
     # ---------------------------------------------------------
 
+    action_type = ACTION_TYPES[action_type]
     conn = get_connection()
 
     try:
         _ensure_pending_actions_table(conn)
-
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
 
         # Prevent duplicate pending requests.
@@ -416,7 +415,7 @@ def handle_interrupt(
 
         readable_action = (
             "cancellation"
-            if action_type == "cancel_order_action"
+            if action_type == "CANCEL_ORDER"
             else "return"
         )
 
@@ -560,7 +559,7 @@ def _result_contains_success(result):
         if not isinstance(content, str):
             content = str(content)
 
-        lowered = content.lower()
+        lowered = content.split("\nEmail status:", 1)[0].lower()
 
         failure_phrases = [
             "could not be cancelled",
@@ -618,6 +617,10 @@ def resume_with_decision(
                 f"Pending action {pending_id} does not exist."
             )
 
+        if (pending["thread_id"], pending["user_email"]) != (thread_id, user_email):
+            raise ValueError("Pending action identity does not match the requested thread.")
+        if thread_id != f"{user_email}:{conversation_id}":
+            raise ValueError("Conversation does not match the pending thread.")
         if pending["status"] != "PENDING":
             raise ValueError(
                 f"Pending action {pending_id} is already "
@@ -643,14 +646,26 @@ def resume_with_decision(
         }
     )
 
+    snapshot = agent.get_state(config)
+    requests = []
+    for task in snapshot.tasks:
+        for interrupt in task.interrupts:
+            requests.extend(interrupt.value.get("action_requests", []))
+    if len(requests) != 1:
+        raise ValueError("Expected exactly one live action awaiting approval.")
+    if pending_id is not None:
+        action = requests[0]
+        args = action.get("args", {})
+        if (ACTION_TYPES.get(action.get("name")) != pending["action_type"]
+                or str(args.get("order_id")) != str(pending["order_id"])
+                or args.get("product_name") != pending["product_name"]
+                or args.get("reason") != pending["reason"]):
+            raise ValueError("Pending row does not match the live interrupted action.")
+    previous_ids = {getattr(m, "id", None) for m in snapshot.values.get("messages", [])}
     result = agent.invoke(
         command,
         config=config,
-        context={
-            "user_email": user_email,
-            "conversation_id": conversation_id,
-            "role": "admin",
-        },
+        context=SessionContext(user_email, conversation_id, "customer"),
     )
 
     if pending_id is not None:
@@ -662,7 +677,7 @@ def resume_with_decision(
             )
 
         else:
-            action_succeeded = _result_contains_success(result)
+            action_succeeded = _result_contains_success({"messages": [m for m in result.get("messages", []) if getattr(m, "id", None) not in previous_ids]})
 
             if action_succeeded:
                 update_pending_status(

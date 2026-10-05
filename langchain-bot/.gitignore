@@ -11,3 +11,4 @@ __pycache__
 .python-version
 uv.lock
 credentials.json
+.DS_Store

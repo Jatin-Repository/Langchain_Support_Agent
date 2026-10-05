@@ -1,6 +1,7 @@
 import streamlit as st
 
 from auth import authenticate_user
+from gmail_tools import initialize_gmail, get_gmail_error
 from hitl_utils import (
     list_pending_actions,
     resume_with_decision,
@@ -59,7 +60,18 @@ def main():
         del st.session_state["admin_user"]
         st.rerun()
 
+    if initialize_gmail():
+        st.sidebar.success("Gmail ready in admin process")
+    else:
+        st.sidebar.warning(f"Gmail unavailable: {get_gmail_error()}")
+
     st.title("Pending Customer Actions")
+    notice = st.session_state.get("approval_notice")
+    if notice:
+        if "NOT_SENT" in notice:
+            st.warning(notice)
+        else:
+            st.success(notice)
 
     col1, col2 = st.columns(2)
 
@@ -70,6 +82,7 @@ def main():
                 "PENDING",
                 "APPROVED",
                 "REJECTED",
+                "FAILED",
             ],
         )
 
@@ -93,7 +106,7 @@ def main():
     for row in rows:
         action_label = (
             "Cancellation"
-            if row["action_type"] == "cancel_order_action"
+            if row["action_type"] == "CANCEL_ORDER"
             else "Return"
         )
 
@@ -162,9 +175,14 @@ def main():
                                     pending_id=row["id"],
                                 )
 
-                            st.success(
-                                "Action approved and executed."
-                            )
+                            notice = "Action approved and executed."
+                            for message in reversed(result.get("messages", [])):
+                                if getattr(message, "name", None) in {"cancel_order_action", "create_return_action"}:
+                                    content = str(getattr(message, "content", ""))
+                                    if "Email status:" in content:
+                                        notice += " " + content.split("Email status:", 1)[1].strip()
+                                    break
+                            st.session_state["approval_notice"] = notice
 
                             st.rerun()
 
@@ -195,9 +213,7 @@ def main():
                                     pending_id=row["id"],
                                 )
 
-                            st.warning(
-                                "Action rejected."
-                            )
+                            st.session_state["approval_notice"] = "Action rejected. No approval email sent."
 
                             st.rerun()
 

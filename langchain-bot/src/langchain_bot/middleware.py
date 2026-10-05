@@ -50,11 +50,8 @@ def model_logging_middleware(request, handler):
     try:
         response = handler(request)
 
-        response_content = getattr(
-            response,
-            "content",
-            ""
-        )
+        model_message = response.result[-1] if response.result else None
+        response_content = getattr(model_message, "content", "")
 
         if isinstance(response_content, str):
             response_preview = response_content[:200]
@@ -69,7 +66,7 @@ def model_logging_middleware(request, handler):
         )
 
         tool_calls = getattr(
-            response,
+            model_message,
             "tool_calls",
             None
         )
