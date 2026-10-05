@@ -190,3 +190,14 @@ Validation during this repair: all 13 tests passed against temporary, real SQLit
 - **Deployment:** this is a local capstone, not a multi-worker production service. SQLite/checkpoint concurrency, atomic thread metadata updates, idempotent cross-process approval, and guaranteed email delivery need additional engineering for production.
 
 Keep `.env`, OAuth credentials/tokens, databases, checkpoints, and the virtual environment out of version control. These files are excluded by `.gitignore` and from the corrected archive.
+
+## .env content
+
+OPENAI_API_KEY="key_value"
+CHECKPOINTS_DB_PATH=checkpoints.sqlite
+PROJECT_ROOT = ../langchain-bot (use the absolute path)
+
+
+## Output
+
+1. The output for the project has been stored in the output_scrrenshot folder for reference.
